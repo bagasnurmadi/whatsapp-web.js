@@ -1796,11 +1796,33 @@ class Client extends EventEmitter {
      * @returns {Promise<Contact>}
      */
     async getContactById(contactId) {
-        let contact = await this.pupPage.evaluate((contactId) => {
-            return window.WWebJS.getContact(contactId);
+        let contact = await this.pupPage.evaluate(async (contactId) => {
+            const getFallbackId = (resolved) =>
+                resolved?.phone?._serialized ||
+                resolved?.phone ||
+                resolved?.lid?._serialized ||
+                resolved?.lid;
+
+            try {
+                const directContact = await window.WWebJS.getContact(contactId);
+                if (directContact) return directContact;
+            } catch {
+                // Fall through to LID/PN resolution.
+            }
+
+            try {
+                const resolved =
+                    await window.WWebJS.enforceLidAndPnRetrieval(contactId);
+                const fallbackId = getFallbackId(resolved);
+                if (!fallbackId || fallbackId === contactId) return null;
+
+                return await window.WWebJS.getContact(fallbackId);
+            } catch {
+                return null;
+            }
         }, contactId);
 
-        return ContactFactory.create(this, contact);
+        return contact ? ContactFactory.create(this, contact) : null;
     }
 
     /**
@@ -2204,14 +2226,40 @@ class Client extends EventEmitter {
      */
     async getProfilePicUrl(contactId) {
         const profilePic = await this.pupPage.evaluate(async (contactId) => {
+            const getFallbackId = (resolved) =>
+                resolved?.phone?._serialized ||
+                resolved?.phone ||
+                resolved?.lid?._serialized ||
+                resolved?.lid;
+            const getChatSafely = async (chatId) => {
+                try {
+                    return await window.WWebJS.getChat(chatId);
+                } catch {
+                    return null;
+                }
+            };
+
             try {
-                const chat = await window.WWebJS.getChat(contactId);
+                let chat = await getChatSafely(contactId);
+
+                if (!chat) {
+                    const resolved =
+                        await window.WWebJS.enforceLidAndPnRetrieval(contactId);
+                    const fallbackId = getFallbackId(resolved);
+
+                    if (fallbackId && fallbackId !== contactId) {
+                        chat = await getChatSafely(fallbackId);
+                    }
+                }
+
+                if (!chat) return undefined;
+
                 return await window
                     .require('WAWebContactProfilePicThumbBridge')
                     .requestProfilePicFromServer(chat);
             } catch (err) {
                 if (err.name === 'ServerStatusCodeError') return undefined;
-                throw err;
+                return undefined;
             }
         }, contactId);
 

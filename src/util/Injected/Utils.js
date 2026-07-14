@@ -1057,19 +1057,45 @@ exports.LoadUtils = () => {
     };
 
     window.WWebJS.getContact = async (contactId) => {
-        const contactWid = window
-            .require('WAWebWidFactory')
-            .createWid(contactId);
-        const contact = await window
-            .require('WAWebCollections')
-            .Contact.find(contactWid);
-        if (contact.isBusiness || contact.isEnterprise) {
-            const bizProfile = await window
-                .require('WAWebCollections')
-                .BusinessProfile.find(contactWid);
-            bizProfile.profileOptions && (contact.businessProfile = bizProfile);
+        try {
+            const WidFactory = window.require('WAWebWidFactory');
+            const ContactCollection = window.require('WAWebCollections').Contact;
+
+            const contactWid = WidFactory.createWid(contactId);
+            let contact = await ContactCollection.find(contactWid);
+
+            if (!contact && contactWid.server === 'lid') {
+                const resolved =
+                    await window.WWebJS.enforceLidAndPnRetrieval(contactId);
+                const fallbackId =
+                    resolved.phone?._serialized ||
+                    resolved.phone ||
+                    resolved.lid?._serialized ||
+                    resolved.lid;
+
+                if (fallbackId) {
+                    const fallbackWid =
+                        typeof fallbackId === 'string'
+                            ? WidFactory.createWid(fallbackId)
+                            : fallbackId;
+                    contact = await ContactCollection.find(fallbackWid);
+                }
+            }
+
+            if (!contact) return null;
+
+            if (contact.isBusiness || contact.isEnterprise) {
+                const bizProfile = await window
+                    .require('WAWebCollections')
+                    .BusinessProfile.find(contact.id);
+                bizProfile?.profileOptions &&
+                    (contact.businessProfile = bizProfile);
+            }
+
+            return window.WWebJS.getContactModel(contact);
+        } catch {
+            return null;
         }
-        return window.WWebJS.getContactModel(contact);
     };
 
     window.WWebJS.getContacts = () => {
