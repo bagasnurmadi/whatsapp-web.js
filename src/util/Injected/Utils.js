@@ -1137,7 +1137,13 @@ exports.LoadUtils = () => {
      * @param {string} msgId
      * @returns {Promise<{blob: Blob, mimetype: string, filename: string, filesize: number}|null>}
      */
-    window.WWebJS.resolveMediaBlob = async (msgId) => {
+    window.WWebJS.resolveMediaBlob = async (msgId, options = {}) => {
+        const {
+            maxAttempts = 6,
+            delayMs = 350,
+        } = options;
+
+        const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         const { Msg } = window.require('WAWebCollections');
         const msg =
             Msg.get(msgId) ||
@@ -1151,41 +1157,54 @@ exports.LoadUtils = () => {
             return null;
         }
 
-        // Always call internal downloadMedia - never skip based on
-        // mediaStage, because cache eviction can leave stage=RESOLVED
-        // with empty InMemoryMediaBlobCache.
-        await msg.downloadMedia({
-            downloadEvenIfExpensive: true,
-            rmrReason: 1,
-            isUserInitiated: true,
-        });
+        let lastStage = msg.mediaData.mediaStage;
 
-        if (
-            msg.mediaData.mediaStage.includes('ERROR') ||
-            msg.mediaData.mediaStage === 'FETCHING'
-        ) {
-            return null;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            // Always call internal downloadMedia - never skip based on
+            // mediaStage, because cache eviction can leave stage=RESOLVED
+            // with empty InMemoryMediaBlobCache.
+            await msg.downloadMedia({
+                downloadEvenIfExpensive: true,
+                rmrReason: 1,
+                isUserInitiated: true,
+            });
+
+            lastStage = msg.mediaData?.mediaStage;
+            if (lastStage?.includes('ERROR')) {
+                return null;
+            }
+
+            const cached = window
+                .require('WAWebMediaInMemoryBlobCache')
+                .InMemoryMediaBlobCache.get(msg.mediaObject?.filehash);
+
+            let blob;
+            if (cached) {
+                blob = cached;
+            } else if (msg.mediaObject?.mediaBlob) {
+                blob = msg.mediaObject.mediaBlob.forceToBlob();
+            }
+
+            if (blob) {
+                return {
+                    blob,
+                    mimetype: msg.mimetype,
+                    filename: msg.filename,
+                    filesize: msg.size,
+                };
+            }
+
+            if (attempt < maxAttempts && lastStage === 'FETCHING') {
+                await wait(delayMs);
+                continue;
+            }
+
+            if (attempt < maxAttempts) {
+                await wait(delayMs);
+            }
         }
 
-        const cached = window
-            .require('WAWebMediaInMemoryBlobCache')
-            .InMemoryMediaBlobCache.get(msg.mediaObject?.filehash);
-
-        let blob;
-        if (cached) {
-            blob = cached;
-        } else if (msg.mediaObject?.mediaBlob) {
-            blob = msg.mediaObject.mediaBlob.forceToBlob();
-        }
-
-        if (!blob) return null;
-
-        return {
-            blob,
-            mimetype: msg.mimetype,
-            filename: msg.filename,
-            filesize: msg.size,
-        };
+        return null;
     };
 
     window.WWebJS.arrayBufferToBase64 = (arrayBuffer) => {

@@ -515,21 +515,56 @@ class Message extends Base {
         if (!this.hasMedia) return undefined;
 
         const result = await this.client.pupPage.evaluate(async (msgId) => {
-            const resolved = await window.WWebJS.resolveMediaBlob(msgId);
-            if (!resolved) return null;
+            try {
+                const resolved = await window.WWebJS.resolveMediaBlob(msgId);
+                if (!resolved) {
+                    const { Msg } = window.require('WAWebCollections');
+                    const msg =
+                        Msg.get(msgId) ||
+                        (await Msg.getMessagesById([msgId]))?.messages?.[0];
 
-            const data = await window.WWebJS.arrayBufferToBase64Async(
-                await resolved.blob.arrayBuffer(),
-            );
-            return {
-                data,
-                mimetype: resolved.mimetype,
-                filename: resolved.filename,
-                filesize: resolved.filesize,
-            };
+                    return {
+                        ok: false,
+                        error: 'Media blob tidak tersedia',
+                        mediaStage: msg?.mediaData?.mediaStage ?? null,
+                        mimetype: msg?.mimetype ?? null,
+                        filename: msg?.filename ?? null,
+                    };
+                }
+
+                const data = await window.WWebJS.arrayBufferToBase64Async(
+                    await resolved.blob.arrayBuffer(),
+                );
+
+                return {
+                    ok: true,
+                    data,
+                    mimetype: resolved.mimetype,
+                    filename: resolved.filename,
+                    filesize: resolved.filesize,
+                };
+            } catch (error) {
+                return {
+                    ok: false,
+                    error: error?.message || String(error),
+                    mediaStage: null,
+                    mimetype: null,
+                    filename: null,
+                };
+            }
         }, this.id._serialized);
 
         if (!result) return undefined;
+        if (!result.ok) {
+            throw new Error(
+                `downloadMedia gagal untuk ${this.id?._serialized || 'unknown'}`
+                + ` | stage=${result.mediaStage || 'unknown'}`
+                + ` | mimetype=${result.mimetype || 'unknown'}`
+                + ` | filename=${result.filename || 'unknown'}`
+                + ` | reason=${result.error || 'unknown'}`
+            );
+        }
+
         return new MessageMedia(
             result.mimetype,
             result.data,
