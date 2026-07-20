@@ -1145,52 +1145,100 @@ exports.LoadUtils = () => {
 
         const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
         const { Msg } = window.require('WAWebCollections');
-        const msg =
+        const getMsg = async () =>
             Msg.get(msgId) ||
             (await Msg.getMessagesById([msgId]))?.messages?.[0];
 
-        if (
-            !msg ||
-            !msg.mediaData ||
-            msg.mediaData.mediaStage === 'REUPLOADING'
-        ) {
+        const getBlobFromMsg = (msg) => {
+            if (!msg) return null;
+
+            const cacheKey =
+                msg.mediaObject?.filehash ||
+                msg.mediaData?.filehash ||
+                msg.filehash ||
+                msg.encFilehash;
+
+            if (cacheKey) {
+                const cached = window
+                    .require('WAWebMediaInMemoryBlobCache')
+                    .InMemoryMediaBlobCache.get(cacheKey);
+                if (cached) return cached;
+            }
+
+            const possibleMediaBlobs = [
+                msg.mediaObject?.mediaBlob,
+                msg.mediaData?.mediaBlob,
+            ];
+
+            for (const mediaBlob of possibleMediaBlobs) {
+                if (!mediaBlob) continue;
+
+                if (typeof mediaBlob.forceToBlob === 'function') {
+                    try {
+                        return mediaBlob.forceToBlob();
+                    } catch {}
+                }
+
+                if (mediaBlob instanceof Blob) {
+                    return mediaBlob;
+                }
+            }
+
+            return null;
+        };
+
+        const getMetadata = (msg) => ({
+            mimetype: msg?.mimetype || msg?.mediaData?.mimetype || null,
+            filename: msg?.filename || null,
+            filesize: msg?.size || msg?.mediaData?.size || null,
+        });
+
+        let msg = await getMsg();
+        if (!msg || !msg.mediaData || msg.mediaData.mediaStage === 'REUPLOADING') {
             return null;
         }
 
         let lastStage = msg.mediaData.mediaStage;
+        let lastError = null;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            // Always call internal downloadMedia - never skip based on
-            // mediaStage, because cache eviction can leave stage=RESOLVED
-            // with empty InMemoryMediaBlobCache.
-            await msg.downloadMedia({
-                downloadEvenIfExpensive: true,
-                rmrReason: 1,
-                isUserInitiated: true,
-            });
+            msg = await getMsg();
+            if (!msg || !msg.mediaData) return null;
 
-            lastStage = msg.mediaData?.mediaStage;
-            if (lastStage?.includes('ERROR')) {
-                return null;
-            }
-
-            const cached = window
-                .require('WAWebMediaInMemoryBlobCache')
-                .InMemoryMediaBlobCache.get(msg.mediaObject?.filehash);
-
-            let blob;
-            if (cached) {
-                blob = cached;
-            } else if (msg.mediaObject?.mediaBlob) {
-                blob = msg.mediaObject.mediaBlob.forceToBlob();
-            }
-
+            let blob = getBlobFromMsg(msg);
             if (blob) {
                 return {
                     blob,
-                    mimetype: msg.mimetype,
-                    filename: msg.filename,
-                    filesize: msg.size,
+                    ...getMetadata(msg),
+                };
+            }
+
+            // Always call internal downloadMedia - never skip based on
+            // mediaStage, because cache eviction can leave stage=RESOLVED
+            // with empty InMemoryMediaBlobCache.
+            try {
+                await msg.downloadMedia({
+                    downloadEvenIfExpensive: true,
+                    rmrReason: 1,
+                    isUserInitiated: true,
+                });
+            } catch (error) {
+                lastError = error;
+            }
+
+            msg = await getMsg();
+            if (!msg || !msg.mediaData) return null;
+
+            lastStage = msg.mediaData?.mediaStage;
+            if (lastStage?.includes('ERROR')) {
+                break;
+            }
+
+            blob = getBlobFromMsg(msg);
+            if (blob) {
+                return {
+                    blob,
+                    ...getMetadata(msg),
                 };
             }
 
@@ -1202,6 +1250,10 @@ exports.LoadUtils = () => {
             if (attempt < maxAttempts) {
                 await wait(delayMs);
             }
+        }
+
+        if (lastError) {
+            throw lastError;
         }
 
         return null;

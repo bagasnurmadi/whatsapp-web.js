@@ -22,6 +22,16 @@ class Message extends Base {
         if (data) this._patch(data);
     }
 
+    _getSerializedId() {
+        return (
+            this.id?._serialized ||
+            this.id?.$1 ||
+            this._data?.id?._serialized ||
+            this._data?.id?.$1 ||
+            null
+        );
+    }
+
     _patch(data) {
         this._data = data;
 
@@ -36,6 +46,17 @@ class Message extends Base {
          * @type {object}
          */
         this.id = data.id;
+        if (this.id && !this.id._serialized) {
+            const serializedFallback =
+                this.id.$1 ||
+                data?.id?._serialized ||
+                data?.id?.$1 ||
+                null;
+
+            if (serializedFallback) {
+                this.id._serialized = serializedFallback;
+            }
+        }
 
         /**
          * ACK status for the message
@@ -355,6 +376,9 @@ class Message extends Base {
      * @returns {Promise<Message>}
      */
     async reload() {
+        const serializedId = this._getSerializedId();
+        if (!serializedId) return null;
+
         const newData = await this.client.pupPage.evaluate(async (msgId) => {
             const msg =
                 window.require('WAWebCollections').Msg.get(msgId) ||
@@ -365,7 +389,7 @@ class Message extends Base {
                 )?.messages?.[0];
             if (!msg) return null;
             return window.WWebJS.getMessageModel(msg);
-        }, this.id._serialized);
+        }, serializedId);
 
         if (!newData) return null;
 
@@ -513,6 +537,10 @@ class Message extends Base {
      */
     async downloadMedia() {
         if (!this.hasMedia) return undefined;
+        const serializedId = this._getSerializedId();
+        if (!serializedId) {
+            throw new Error('downloadMedia gagal: serialized message id tidak tersedia');
+        }
 
         const result = await this.client.pupPage.evaluate(async (msgId) => {
             try {
@@ -552,12 +580,12 @@ class Message extends Base {
                     filename: null,
                 };
             }
-        }, this.id._serialized);
+        }, serializedId);
 
         if (!result) return undefined;
         if (!result.ok) {
             throw new Error(
-                `downloadMedia gagal untuk ${this.id?._serialized || 'unknown'}`
+                `downloadMedia gagal untuk ${serializedId || 'unknown'}`
                 + ` | stage=${result.mediaStage || 'unknown'}`
                 + ` | mimetype=${result.mimetype || 'unknown'}`
                 + ` | filename=${result.filename || 'unknown'}`
@@ -581,13 +609,15 @@ class Message extends Base {
      */
     async downloadMediaStream({ chunkSize = 10 * 1024 * 1024 } = {}) {
         if (!this.hasMedia) return undefined;
+        const serializedId = this._getSerializedId();
+        if (!serializedId) return undefined;
 
         const blobHandle = await this.client.pupPage.evaluateHandle(
             async (msgId) => {
                 const result = await window.WWebJS.resolveMediaBlob(msgId);
                 return result?.blob ?? null;
             },
-            this.id._serialized,
+            serializedId,
         );
 
         let metadata;
@@ -601,7 +631,7 @@ class Message extends Base {
                     filename: msg?.filename,
                     filesize: msg?.size,
                 };
-            }, this.id._serialized);
+            }, serializedId);
         } catch (err) {
             await blobHandle.dispose().catch(() => {});
             throw err;
