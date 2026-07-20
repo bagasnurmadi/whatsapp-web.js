@@ -1193,6 +1193,41 @@ exports.LoadUtils = () => {
             filesize: msg?.size || msg?.mediaData?.size || null,
         });
 
+        const safeCall = async (fn, args = []) => {
+            try {
+                return await fn(...args);
+            } catch (error) {
+                throw error;
+            }
+        };
+
+        const buildDownloadCandidates = (msg) => {
+            const commonArgs = [{
+                downloadEvenIfExpensive: true,
+                rmrReason: 1,
+                isUserInitiated: true,
+            }];
+
+            const candidates = [];
+            const pushCandidate = (owner, methodName, args = []) => {
+                if (owner && typeof owner[methodName] === 'function') {
+                    candidates.push({
+                        label: methodName,
+                        run: () => safeCall(owner[methodName].bind(owner), args),
+                    });
+                }
+            };
+
+            pushCandidate(msg, 'downloadMedia', commonArgs);
+            pushCandidate(msg, 'downloadAndMaybeDecrypt', commonArgs);
+            pushCandidate(msg, 'downloadAndDecrypt', commonArgs);
+            pushCandidate(msg?.mediaData, 'downloadMedia', commonArgs);
+            pushCandidate(msg?.mediaData, 'downloadAndMaybeDecrypt', commonArgs);
+            pushCandidate(msg?.mediaData, 'downloadAndDecrypt', commonArgs);
+
+            return candidates;
+        };
+
         let msg = await getMsg();
         if (!msg || !msg.mediaData || msg.mediaData.mediaStage === 'REUPLOADING') {
             return null;
@@ -1213,17 +1248,25 @@ exports.LoadUtils = () => {
                 };
             }
 
-            // Always call internal downloadMedia - never skip based on
-            // mediaStage, because cache eviction can leave stage=RESOLVED
-            // with empty InMemoryMediaBlobCache.
-            try {
-                await msg.downloadMedia({
-                    downloadEvenIfExpensive: true,
-                    rmrReason: 1,
-                    isUserInitiated: true,
-                });
-            } catch (error) {
-                lastError = error;
+            const candidates = buildDownloadCandidates(msg);
+
+            for (const candidate of candidates) {
+                try {
+                    await candidate.run();
+                } catch (error) {
+                    lastError = error;
+                }
+
+                msg = await getMsg();
+                if (!msg || !msg.mediaData) return null;
+
+                blob = getBlobFromMsg(msg);
+                if (blob) {
+                    return {
+                        blob,
+                        ...getMetadata(msg),
+                    };
+                }
             }
 
             msg = await getMsg();
