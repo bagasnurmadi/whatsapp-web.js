@@ -841,7 +841,8 @@ exports.LoadUtils = () => {
 
     window.WWebJS.getChat = async (chatId, { getAsModel = true } = {}) => {
         const isChannel = /@\w*newsletter\b/.test(chatId);
-        const chatWid = window.require('WAWebWidFactory').createWid(chatId);
+        const WidFactory = window.require('WAWebWidFactory');
+        const chatWid = WidFactory.createWid(chatId);
         let chat;
 
         if (isChannel) {
@@ -861,13 +862,37 @@ exports.LoadUtils = () => {
                 chat = null;
             }
         } else {
-            chat =
-                window.require('WAWebCollections').Chat.get(chatWid) ||
+            const resolveChat = async (wid) =>
+                window.require('WAWebCollections').Chat.get(wid) ||
                 (
                     await window
                         .require('WAWebFindChatAction')
-                        .findOrCreateLatestChat(chatWid)
+                        .findOrCreateLatestChat(wid)
                 )?.chat;
+
+            chat = await resolveChat(chatWid);
+
+            if (!chat && chatWid.server === 'lid') {
+                try {
+                    const resolved =
+                        await window.WWebJS.enforceLidAndPnRetrieval(chatId);
+                    const fallbackId =
+                        resolved.phone?._serialized ||
+                        resolved.phone ||
+                        resolved.lid?._serialized ||
+                        resolved.lid;
+
+                    if (fallbackId && fallbackId !== chatId) {
+                        const fallbackWid =
+                            typeof fallbackId === 'string'
+                                ? WidFactory.createWid(fallbackId)
+                                : fallbackId;
+                        chat = await resolveChat(fallbackWid);
+                    }
+                } catch (ignoredError) {
+                    chat = chat || null;
+                }
+            }
         }
 
         return getAsModel && chat

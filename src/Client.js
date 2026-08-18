@@ -1752,7 +1752,29 @@ class Client extends EventEmitter {
      */
     async getChatById(chatId) {
         const chat = await this.pupPage.evaluate(async (chatId) => {
-            return await window.WWebJS.getChat(chatId);
+            const getFallbackId = (resolved) =>
+                resolved?.phone?._serialized ||
+                resolved?.phone ||
+                resolved?.lid?._serialized ||
+                resolved?.lid;
+
+            try {
+                const directChat = await window.WWebJS.getChat(chatId);
+                if (directChat) return directChat;
+            } catch {
+                // Fall through to LID/PN resolution.
+            }
+
+            try {
+                const resolved =
+                    await window.WWebJS.enforceLidAndPnRetrieval(chatId);
+                const fallbackId = getFallbackId(resolved);
+                if (!fallbackId || fallbackId === chatId) return null;
+
+                return await window.WWebJS.getChat(fallbackId);
+            } catch {
+                return null;
+            }
         }, chatId);
         return chat ? ChatFactory.create(this, chat) : undefined;
     }
