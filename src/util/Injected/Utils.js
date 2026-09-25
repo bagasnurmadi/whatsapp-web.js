@@ -483,6 +483,10 @@ exports.LoadUtils = () => {
             ...extraOptions,
         };
 
+        // MediaData exposes an internal model ID that must not be copied to the
+        // outgoing Msg model. The valid message ID is the newMsgKey above.
+        delete message.__x_id;
+
         // Bot's won't reply if canonicalUrl is set (linking)
         if (botOptions) {
             delete message.canonicalUrl;
