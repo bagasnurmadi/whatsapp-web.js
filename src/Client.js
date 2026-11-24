@@ -34,7 +34,323 @@ const {
     ScheduledEvent,
 } = require('./structures');
 const NoAuth = require('./authStrategies/NoAuth');
-const { exposeFunctionIfAbsent } = require('./util/Puppeteer');
+const { exposeFunctionIfAbsent, upsertFunction } = require('./util/Puppeteer');
+
+/**
+ * Positive runtime probe for the current WhatsApp Web login bootstrap.
+ * WAWebSocketModel is registered on the unauthenticated /login page but its
+ * dependencies cannot resolve there, so require() returns null indefinitely.
+ * In that case the login shell itself is the only verified auth signal.
+ *
+ * @param {boolean} pairingRequested
+ * @returns {false|{need: boolean, state: string|null, source: string}}
+ */
+const authBootstrapProbe = (pairingRequested) => {
+    const safe = (fn) => {
+        try {
+            return fn();
+        } catch (err) {
+            window.__wwjsAuthProbeError = String(
+                err && err.message ? err.message : err,
+            ).slice(0, 200);
+            return undefined;
+        }
+    };
+    // Cache successfully resolved modules. On the login shell, repeatedly
+    // requiring WAWebSocketModel produces ModuleError rejections (unknown
+    // module / unresolved dependencies); throttle the unresolved probe.
+    const getModule = (name) => {
+        const cache = (window.__wwjsAuthModuleCache =
+            window.__wwjsAuthModuleCache || {});
+        if (cache[name]) return cache[name];
+        return safe(() => {
+            const mod = window.require?.(name);
+            // Only cache Socket once it is actually usable; an unresolved
+            // stub must not shadow the real module after authentication.
+            if (mod && (name !== 'WAWebSocketModel' || mod.Socket)) {
+                cache[name] = mod;
+            }
+            return mod;
+        });
+    };
+    const probeSocketModule = () => {
+        const cache = window.__wwjsAuthModuleCache || {};
+        if (cache.WAWebSocketModel?.Socket) return cache.WAWebSocketModel;
+        const now = Date.now();
+        if (now - (window.__wwjsAuthSocketProbeAt || 0) < 2000) {
+            return undefined;
+        }
+        window.__wwjsAuthSocketProbeAt = now;
+        return getModule('WAWebSocketModel');
+    };
+
+    const pathname = safe(() => location.pathname) || '';
+    const loginRoute = pathname.startsWith('/login');
+    const qrUi = Boolean(
+        safe(() =>
+            document.querySelector('[data-testid="link-device-qr-code"]'),
+        ),
+    );
+    const phoneUi = Boolean(
+        safe(() =>
+            document.querySelector(
+                '[data-testid="link_device_qr_phone_number_link"], [data-testid="link_device_qr_phone_number_shortcut_link"]',
+            ),
+        ),
+    );
+
+    const socketModule = probeSocketModule();
+    const socket = safe(() => socketModule?.Socket);
+    const state = safe(() => socket?.state);
+
+    // Positive login-shell signal. On the current shell Socket is registered
+    // but cannot resolve until authentication, so wait for the login UI when
+    // the module is absent. If an older shell does expose Socket, preserve the
+    // original state machine and never bypass transient states.
+    if (loginRoute) {
+        if (socket) {
+            if (
+                state === 'OPENING' ||
+                state === 'UNLAUNCHED' ||
+                state === 'PAIRING'
+            ) {
+                return false;
+            }
+            if (!state) return false;
+            return {
+                need: state === 'UNPAIRED' || state === 'UNPAIRED_IDLE',
+                state,
+                source: 'socket',
+            };
+        }
+
+        if (pairingRequested) {
+            const conn = safe(() => getModule('WAWebConnModel')?.Conn);
+            const pairingApi = Boolean(
+                safe(() => getModule('WAWebAltDeviceLinkingApi')),
+            );
+            if (pairingApi && (phoneUi || conn)) {
+                return {
+                    need: true,
+                    state: null,
+                    source: 'login_page_pairing',
+                };
+            }
+            return false;
+        }
+
+        const conn = safe(() => getModule('WAWebConnModel')?.Conn);
+        const ref = safe(() => conn?.ref);
+        const qrModulesReady = [
+            'WAWebSignalStoreApi',
+            'WAWebUserPrefsInfoStore',
+            'WAWebUserPrefsMultiDevice',
+            'WAWebCompanionRegClientUtils',
+            'WABase64',
+        ].every((name) => Boolean(getModule(name)));
+        if (ref !== undefined && ref !== null && qrUi && qrModulesReady) {
+            return { need: true, state: null, source: 'login_page_qr' };
+        }
+        return false;
+    }
+
+    // Authenticated page (or an older WhatsApp Web where Socket is loaded).
+    if (!state) return false;
+    if (state === 'OPENING' || state === 'UNLAUNCHED' || state === 'PAIRING') {
+        return false;
+    }
+    return {
+        need: state === 'UNPAIRED' || state === 'UNPAIRED_IDLE',
+        state,
+        source: 'socket',
+    };
+};
+
+/**
+ * The QR flow needs the login-shell modules, but explicitly not Socket.
+ * @returns {boolean}
+ */
+const qrBootstrapReady = () => {
+    try {
+        const req = window.require;
+        if (typeof req !== 'function') return false;
+        const conn = req('WAWebConnModel')?.Conn;
+        return Boolean(
+            req('WAWebSignalStoreApi')?.waSignalStore &&
+            req('WAWebUserPrefsInfoStore')?.waNoiseInfo &&
+            typeof req('WABase64')?.encodeB64 === 'function' &&
+            typeof req('WAWebUserPrefsMultiDevice')?.getADVSecretKey ===
+                'function' &&
+            req('WAWebCompanionRegClientUtils')?.DEVICE_PLATFORM &&
+            conn &&
+            conn.ref != null,
+        );
+    } catch {
+        return false;
+    }
+};
+
+/**
+ * Install Socket/Cmd bridges. Socket is optional: it does not resolve on the
+ * unauthenticated login page, while Cmd and the login shell do.
+ * Must stay synchronous around listener registration and the hasSynced check.
+ */
+const installWWebJSBridges = () => {
+    const safeRequire = (name) => {
+        try {
+            return window.require?.(name);
+        } catch {
+            return undefined;
+        }
+    };
+    const Socket = safeRequire('WAWebSocketModel')?.Socket;
+    const Cmd = safeRequire('WAWebCmd')?.Cmd;
+
+    if (!Socket && !Cmd) {
+        return { socketReady: false, cmdReady: false, state: null };
+    }
+
+    const listeners = [];
+    if (Socket) {
+        listeners.push([
+            Socket,
+            'change:state',
+            (_AppState, state) => {
+                window.onAuthAppStateChangedEvent(state);
+            },
+        ]);
+        listeners.push([
+            Socket,
+            'change:hasSynced',
+            () => {
+                window.onAppStateHasSyncedEvent();
+            },
+        ]);
+    }
+    if (Cmd) {
+        listeners.push([
+            Cmd,
+            'offline_progress_update_from_bridge',
+            () => {
+                window.onOfflineProgressUpdateEvent(
+                    window
+                        .require('WAWebOfflineHandler')
+                        .OfflineMessageHandler.getOfflineDeliveryProgress(),
+                );
+            },
+        ]);
+        listeners.push([
+            Cmd,
+            'logout',
+            async () => {
+                await window.onLogoutEvent();
+            },
+        ]);
+        listeners.push([
+            Cmd,
+            'logout_from_bridge',
+            async () => {
+                await window.onLogoutEvent();
+            },
+        ]);
+    }
+
+    // Clean up old listeners to prevent accumulation on re-inject
+    if (window._wwjsListeners) {
+        for (const [obj, event, handler] of window._wwjsListeners) {
+            try {
+                obj.off(event, handler);
+            } catch {
+                // old page object is gone
+            }
+        }
+    }
+
+    for (const [obj, event, handler] of listeners) {
+        obj.on(event, handler);
+    }
+    window._wwjsListeners = listeners;
+
+    // Now that Socket exists, release the QR ref listener on successful sync.
+    if (Socket && window._wwjsQRListener) {
+        const qrListener = window._wwjsQRListener;
+        Socket.once('change:hasSynced', () => {
+            try {
+                qrListener.conn.off('change:ref', qrListener.handler);
+            } catch {
+                // conn was replaced with the authenticated session
+            }
+            if (window._wwjsQRListener === qrListener) {
+                window._wwjsQRListener = null;
+            }
+            window._wwjsLastQRRef = null;
+        });
+    }
+
+    // Atomic hasSynced check in the same synchronous block as listener
+    // registration. If hasSynced is already true, Backbone won't fire
+    // change:hasSynced (no transition).
+    const storeInjected = typeof window.WWebJS !== 'undefined';
+    if (Socket && Socket.hasSynced === true && !storeInjected) {
+        window.onAppStateHasSyncedEvent();
+    }
+
+    return {
+        socketReady: Boolean(Socket),
+        cmdReady: Boolean(Cmd),
+        state: Socket?.state ?? null,
+    };
+};
+
+/**
+ * Snapshot of non-sensitive bootstrap signals for diagnostics.
+ */
+const collectAuthRuntimeSignals = () => {
+    const safe = (fn) => {
+        try {
+            return fn();
+        } catch {
+            return null;
+        }
+    };
+    const moduleStatus = (name) => {
+        try {
+            if (typeof window.require !== 'function') return 'no-require';
+            const mod = window.require(name);
+            if (mod === undefined) return 'undefined';
+            if (mod === null) return 'null';
+            return `object:${Object.keys(mod).length}`;
+        } catch {
+            return 'throw';
+        }
+    };
+    const socket = safe(
+        () => window.require?.('WAWebSocketModel')?.Socket || null,
+    );
+    const conn = safe(() => window.require?.('WAWebConnModel')?.Conn || null);
+    return {
+        pathname: safe(() => location.pathname),
+        webVersion: safe(() => window.Debug?.VERSION ?? null),
+        hasRequire: typeof window.require === 'function',
+        socketModule: moduleStatus('WAWebSocketModel'),
+        socketExists: Boolean(socket),
+        socketState: socket?.state ?? null,
+        socketHasSynced: socket?.hasSynced ?? null,
+        connExists: Boolean(conn),
+        connRefReady: conn?.ref !== undefined && conn?.ref !== null,
+        qrUi: Boolean(
+            document.querySelector('[data-testid="link-device-qr-code"]'),
+        ),
+        phonePairingUi: Boolean(
+            document.querySelector(
+                '[data-testid="link_device_qr_phone_number_link"], [data-testid="link_device_qr_phone_number_shortcut_link"]',
+            ),
+        ),
+        wwebjsInjected: typeof window.WWebJS !== 'undefined',
+        canvasCount: document.querySelectorAll('canvas').length,
+        authProbeError: window.__wwjsAuthProbeError ?? null,
+    };
+};
 
 /**
  * Starting point for interacting with the WhatsApp Web API
@@ -104,7 +420,60 @@ class Client extends EventEmitter {
         this.currentIndexHtml = null;
         this.lastLoggedOut = false;
 
+        this._injectEpoch = 0;
+        this._qrLoadingScreenListener = null;
+        /**
+         * Non-sensitive authentication bootstrap diagnostics (stage, login
+         * route, module availability, socket state). Never contains QR data,
+         * pairing codes, cookies, or credentials.
+         * @type {object}
+         */
+        this.authDiagnostics = {
+            stage: 'not_initialized',
+            at: new Date().toISOString(),
+            history: [],
+        };
+
         Util.setFfmpegPath(this.options.ffmpegPath);
+    }
+
+    /**
+     * Update the non-sensitive authentication diagnostics snapshot.
+     * @param {string} stage
+     * @param {object} [details]
+     */
+    _setAuthDiagnostics(stage, details = {}) {
+        const at = new Date().toISOString();
+        const history = (this.authDiagnostics.history || []).concat({
+            stage,
+            at,
+        });
+        this.authDiagnostics = {
+            ...this.authDiagnostics,
+            ...details,
+            stage,
+            at,
+            history: history.slice(-30),
+        };
+    }
+
+    /**
+     * Capture a non-sensitive runtime snapshot for a failed auth stage.
+     * @param {string} stage
+     */
+    async _captureAuthDiagnostics(stage) {
+        let runtime;
+        try {
+            runtime = await this.pupPage.evaluate(collectAuthRuntimeSignals);
+        } catch (err) {
+            runtime = {
+                snapshotError: String(
+                    err && err.message ? err.message : err,
+                ).slice(0, 160),
+            };
+        }
+        this._setAuthDiagnostics(stage, { runtime });
+        return this.authDiagnostics;
     }
 
     /**
@@ -116,50 +485,80 @@ class Client extends EventEmitter {
         if (this._injectAbort) this._injectAbort.abort();
         const abort = new AbortController();
         this._injectAbort = abort;
+        // Invalidate callbacks from a superseded injection run.
+        this._injectEpoch += 1;
+        const epoch = this._injectEpoch;
 
         try {
             const authTimeout = this.options.authTimeoutMs || 30000;
-            await this.pupPage
-                .waitForFunction('window.Debug?.VERSION != undefined', {
-                    timeout: authTimeout,
-                    signal: abort.signal,
-                })
-                .catch((err) => {
-                    if (abort.signal.aborted) throw err;
-                    throw 'auth timeout';
-                });
+            this._setAuthDiagnostics('waiting_for_web_version');
+            try {
+                await this.pupPage.waitForFunction(
+                    'window.Debug?.VERSION != undefined',
+                    { timeout: authTimeout, signal: abort.signal },
+                );
+            } catch (err) {
+                if (abort.signal.aborted) throw err;
+                await this._captureAuthDiagnostics(
+                    'timeout_waiting_for_web_version',
+                );
+                throw 'auth timeout';
+            }
             if (abort.signal.aborted) return;
             await this.setDeviceName(
                 this.options.deviceName,
                 this.options.browserName,
             );
+            if (abort.signal.aborted) return;
             const pairWithPhoneNumber = this.options.pairWithPhoneNumber;
             const version = await this.getWWebVersion();
+            const pairingRequested = Boolean(pairWithPhoneNumber.phoneNumber);
 
-            const needAuthHandle = await this.pupPage.waitForFunction(
-                () => {
-                    const state =
-                        window.require?.('WAWebSocketModel')?.Socket?.state;
-                    if (
-                        !state ||
-                        state === 'OPENING' ||
-                        state === 'UNLAUNCHED' ||
-                        state === 'PAIRING'
-                    ) {
-                        return false;
-                    }
-                    return {
-                        need: state === 'UNPAIRED' || state === 'UNPAIRED_IDLE',
-                        state,
-                    };
-                },
-                { timeout: authTimeout },
-            );
-            const needAuthentication = await needAuthHandle.jsonValue();
+            this._setAuthDiagnostics('waiting_for_auth_bootstrap', {
+                webVersion: version,
+            });
+
+            let needAuthHandle;
+            try {
+                needAuthHandle = await this.pupPage.waitForFunction(
+                    authBootstrapProbe,
+                    {
+                        timeout: authTimeout,
+                        signal: abort.signal,
+                        polling: 250,
+                    },
+                    pairingRequested,
+                );
+            } catch (err) {
+                if (abort.signal.aborted) throw err;
+                await this._captureAuthDiagnostics(
+                    'timeout_waiting_for_socket_or_login_page',
+                );
+                if (err && typeof err === 'object') {
+                    err.authDiagnostics = this.authDiagnostics;
+                }
+                throw err;
+            }
+
+            let needAuthentication;
+            try {
+                needAuthentication = await needAuthHandle.jsonValue();
+            } finally {
+                await needAuthHandle.dispose().catch(() => {});
+            }
+
+            this._setAuthDiagnostics('auth_bootstrap_resolved', {
+                source: needAuthentication.source,
+                socketState: needAuthentication.state,
+                authenticationRequired: needAuthentication.need,
+            });
 
             if (needAuthentication.need) {
                 const { failed, failureEventPayload, restart } =
                     await this.authStrategy.onAuthenticationNeeded();
+                if (abort.signal.aborted || epoch !== this._injectEpoch) {
+                    return;
+                }
 
                 if (failed) {
                     /**
@@ -181,22 +580,60 @@ class Client extends EventEmitter {
 
                 // Register qr/code events
                 if (pairWithPhoneNumber.phoneNumber) {
+                    this._setAuthDiagnostics('requesting_pairing_code');
                     this.requestPairingCode(
                         pairWithPhoneNumber.phoneNumber,
                         pairWithPhoneNumber.showNotification,
                         pairWithPhoneNumber.intervalMs,
-                    );
+                    ).catch((err) => {
+                        this._setAuthDiagnostics('pairing_code_error', {
+                            error: String(
+                                err && err.message ? err.message : err,
+                            ).slice(0, 160),
+                        });
+                    });
                 } else {
                     let qrRetries = 0;
 
-                    this.on(Events.LOADING_SCREEN, () => {
+                    if (this._qrLoadingScreenListener) {
+                        this.removeListener(
+                            Events.LOADING_SCREEN,
+                            this._qrLoadingScreenListener,
+                        );
+                    }
+                    this._qrLoadingScreenListener = () => {
                         qrRetries = 0;
-                    });
+                    };
+                    this.on(
+                        Events.LOADING_SCREEN,
+                        this._qrLoadingScreenListener,
+                    );
 
-                    await exposeFunctionIfAbsent(
+                    this._setAuthDiagnostics('waiting_for_qr_bootstrap');
+                    try {
+                        // The login shell exposes its QR modules, but not Socket.
+                        await this.pupPage.waitForFunction(qrBootstrapReady, {
+                            timeout: authTimeout,
+                            signal: abort.signal,
+                            polling: 250,
+                        });
+                    } catch (err) {
+                        if (abort.signal.aborted) throw err;
+                        await this._captureAuthDiagnostics(
+                            'timeout_waiting_for_qr_bootstrap',
+                        );
+                        if (err && typeof err === 'object') {
+                            err.authDiagnostics = this.authDiagnostics;
+                        }
+                        throw err;
+                    }
+
+                    await upsertFunction(
                         this.pupPage,
                         'onQRChangedEvent',
                         async (qr) => {
+                            if (epoch !== this._injectEpoch) return;
+                            this._setAuthDiagnostics('qr_received');
                             /**
                              * Emitted when a QR code is received
                              * @event Client#qr
@@ -216,7 +653,25 @@ class Client extends EventEmitter {
                         },
                     );
 
+                    if (abort.signal.aborted || epoch !== this._injectEpoch) {
+                        return;
+                    }
                     await this.pupPage.evaluate(async () => {
+                        const Conn = window.require('WAWebConnModel').Conn;
+
+                        // Re-injection must not accumulate ref listeners.
+                        if (window._wwjsQRListener) {
+                            try {
+                                window._wwjsQRListener.conn.off(
+                                    'change:ref',
+                                    window._wwjsQRListener.handler,
+                                );
+                            } catch {
+                                // previous Conn is gone
+                            }
+                            window._wwjsQRListener = null;
+                        }
+
                         const registrationInfo = await window
                             .require('WAWebSignalStoreApi')
                             .waSignalStore.getRegistrationInfo();
@@ -248,50 +703,94 @@ class Client extends EventEmitter {
 
                         const onRefChange = (_, ref) => {
                             if (ref == null) return;
+                            // Collapse duplicate events for the same ref.
+                            if (window._wwjsLastQRRef === ref) return;
+                            window._wwjsLastQRRef = ref;
                             window.onQRChangedEvent(getQR(ref));
                         };
 
-                        window.onQRChangedEvent(
-                            getQR(window.require('WAWebConnModel').Conn.ref),
-                        ); // initial qr
-                        window
-                            .require('WAWebConnModel')
-                            .Conn.on('change:ref', onRefChange); // future QR changes
+                        const initialRef = Conn.ref;
+                        if (
+                            initialRef != null &&
+                            window._wwjsLastQRRef !== initialRef
+                        ) {
+                            window._wwjsLastQRRef = initialRef;
+                            window.onQRChangedEvent(getQR(initialRef)); // initial qr
+                        }
+                        Conn.on('change:ref', onRefChange); // future QR changes
+                        window._wwjsQRListener = {
+                            conn: Conn,
+                            handler: onRefChange,
+                        };
 
-                        // Remove QR listener once authentication succeeds
-                        window
-                            .require('WAWebSocketModel')
-                            .Socket.on('change:hasSynced', () => {
-                                window
-                                    .require('WAWebConnModel')
-                                    .Conn.off('change:ref', onRefChange);
+                        // Socket is unresolved on the new login pages. The
+                        // bridge installer releases this listener once Socket
+                        // becomes available and syncs.
+                        let Socket;
+                        try {
+                            Socket =
+                                window.require?.('WAWebSocketModel')?.Socket;
+                        } catch {
+                            Socket = undefined;
+                        }
+                        if (Socket) {
+                            Socket.once('change:hasSynced', () => {
+                                try {
+                                    Conn.off('change:ref', onRefChange);
+                                } catch {
+                                    // authenticated Conn replaced it
+                                }
+                                if (
+                                    window._wwjsQRListener?.handler ===
+                                    onRefChange
+                                ) {
+                                    window._wwjsQRListener = null;
+                                }
+                                window._wwjsLastQRRef = null;
                             });
+                        }
                     });
                 }
             }
 
-            await exposeFunctionIfAbsent(
+            if (abort.signal.aborted || epoch !== this._injectEpoch) return;
+
+            await upsertFunction(
                 this.pupPage,
                 'onAuthAppStateChangedEvent',
                 async (state) => {
+                    if (epoch !== this._injectEpoch || abort.signal.aborted) {
+                        return;
+                    }
                     if (
                         state == 'UNPAIRED_IDLE' &&
                         !pairWithPhoneNumber.phoneNumber
                     ) {
                         // refresh qr code
-                        await this.pupPage.evaluate(() => {
-                            window.require('WAWebCmd').Cmd.refreshQR();
-                        });
+                        try {
+                            await this.pupPage.evaluate(() => {
+                                window.require('WAWebCmd').Cmd.refreshQR();
+                            });
+                        } catch (err) {
+                            if (!abort.signal.aborted) throw err;
+                        }
                     }
                 },
             );
+            if (abort.signal.aborted || epoch !== this._injectEpoch) return;
 
-            await exposeFunctionIfAbsent(
+            await upsertFunction(
                 this.pupPage,
                 'onAppStateHasSyncedEvent',
                 async () => {
+                    if (epoch !== this._injectEpoch || abort.signal.aborted) {
+                        return;
+                    }
                     const authEventPayload =
                         await this.authStrategy.getAuthEventPayload();
+                    if (epoch !== this._injectEpoch || abort.signal.aborted) {
+                        return;
+                    }
                     /**
                      * Emitted when authentication is successful
                      * @event Client#authenticated
@@ -301,6 +800,9 @@ class Client extends EventEmitter {
                     const injected = await this.pupPage.evaluate(async () => {
                         return typeof window.WWebJS !== 'undefined';
                     });
+                    if (epoch !== this._injectEpoch || abort.signal.aborted) {
+                        return;
+                    }
 
                     if (!injected) {
                         if (
@@ -323,14 +825,21 @@ class Client extends EventEmitter {
                         // Load util functions (serializers, helper functions)
                         await this.pupPage.evaluate(LoadUtils);
 
-                        await this.pupPage
-                            .waitForFunction(
+                        try {
+                            await this.pupPage.waitForFunction(
                                 'typeof window.WWebJS !== "undefined"',
-                                { timeout: 30000 },
-                            )
-                            .catch(() => {
-                                throw 'ready timeout';
-                            });
+                                { timeout: 30000, signal: abort.signal },
+                            );
+                        } catch (ignoredError) {
+                            if (abort.signal.aborted) return;
+                            throw 'ready timeout';
+                        }
+                        if (
+                            epoch !== this._injectEpoch ||
+                            abort.signal.aborted
+                        ) {
+                            return;
+                        }
 
                         /**
                          * Current connection information
@@ -358,6 +867,10 @@ class Client extends EventEmitter {
 
                         await this.attachEventListeners();
                     }
+                    if (epoch !== this._injectEpoch || abort.signal.aborted) {
+                        return;
+                    }
+                    this._setAuthDiagnostics('ready');
                     /**
                      * Emitted when the client has initialized and is ready to receive messages.
                      * @event Client#ready
@@ -366,93 +879,47 @@ class Client extends EventEmitter {
                     this.authStrategy.afterAuthReady();
                 },
             );
+            if (abort.signal.aborted || epoch !== this._injectEpoch) return;
             let lastPercent = null;
-            await exposeFunctionIfAbsent(
+            await upsertFunction(
                 this.pupPage,
                 'onOfflineProgressUpdateEvent',
                 async (percent) => {
+                    if (epoch !== this._injectEpoch || abort.signal.aborted) {
+                        return;
+                    }
                     if (lastPercent !== percent) {
                         lastPercent = percent;
                         this.emit(Events.LOADING_SCREEN, percent, 'WhatsApp'); // Message is hardcoded as "WhatsApp" for now
                     }
                 },
             );
-            await exposeFunctionIfAbsent(
-                this.pupPage,
-                'onLogoutEvent',
-                async () => {
-                    this.lastLoggedOut = true;
-                    await this.pupPage
-                        .waitForNavigation({ waitUntil: 'load', timeout: 5000 })
-                        .catch((_) => _);
-                },
-            );
-            await this.pupPage.evaluate(() => {
-                const Socket = window.require('WAWebSocketModel').Socket;
-                const Cmd = window.require('WAWebCmd').Cmd;
-
-                const listeners = [
-                    [
-                        Socket,
-                        'change:state',
-                        (_AppState, state) => {
-                            window.onAuthAppStateChangedEvent(state);
-                        },
-                    ],
-                    [
-                        Socket,
-                        'change:hasSynced',
-                        () => {
-                            window.onAppStateHasSyncedEvent();
-                        },
-                    ],
-                    [
-                        Cmd,
-                        'offline_progress_update_from_bridge',
-                        () => {
-                            window.onOfflineProgressUpdateEvent(
-                                window
-                                    .require('WAWebOfflineHandler')
-                                    .OfflineMessageHandler.getOfflineDeliveryProgress(),
-                            );
-                        },
-                    ],
-                    [
-                        Cmd,
-                        'logout',
-                        async () => {
-                            await window.onLogoutEvent();
-                        },
-                    ],
-                    [
-                        Cmd,
-                        'logout_from_bridge',
-                        async () => {
-                            await window.onLogoutEvent();
-                        },
-                    ],
-                ];
-
-                // Clean up old listeners to prevent accumulation on re-inject
-                if (window._wwjsListeners) {
-                    for (const [obj, event, handler] of window._wwjsListeners) {
-                        obj.off(event, handler);
-                    }
+            if (abort.signal.aborted || epoch !== this._injectEpoch) return;
+            await upsertFunction(this.pupPage, 'onLogoutEvent', async () => {
+                if (epoch !== this._injectEpoch || abort.signal.aborted) {
+                    return;
                 }
-
-                for (const [obj, event, handler] of listeners) {
-                    obj.on(event, handler);
-                }
-                window._wwjsListeners = listeners;
-
-                // Atomic hasSynced check in the same synchronous block as listener registration.
-                // If hasSynced is already true, Backbone won't fire change:hasSynced (no transition).
-                // If hasSynced is false, the listener above will catch the future transition.
-                const storeInjected = typeof window.WWebJS !== 'undefined';
-                if (Socket.hasSynced === true && !storeInjected) {
-                    window.onAppStateHasSyncedEvent();
-                }
+                this.lastLoggedOut = true;
+                await this.pupPage
+                    .waitForNavigation({ waitUntil: 'load', timeout: 5000 })
+                    .catch((_) => _);
             });
+            if (abort.signal.aborted || epoch !== this._injectEpoch) return;
+
+            const bridges = await this.pupPage.evaluate(installWWebJSBridges);
+            if (abort.signal.aborted || epoch !== this._injectEpoch) return;
+            this._setAuthDiagnostics('bridges_installed', {
+                socketReady: Boolean(bridges?.socketReady),
+                cmdReady: Boolean(bridges?.cmdReady),
+                socketState: bridges?.state ?? null,
+            });
+
+            if (!bridges?.socketReady) {
+                // New login shell: Socket resolves only after authentication.
+                // Do not block initialization or QR delivery on it, but attach
+                // the auth bridges as soon as it appears (SPA transition).
+                this._awaitSocketBootstrap(abort, epoch);
+            }
         } catch (err) {
             if (abort.signal.aborted) return; // superseded by newer inject
             throw err;
@@ -461,6 +928,51 @@ class Client extends EventEmitter {
                 this._injectAbort = null;
             }
         }
+    }
+
+    /**
+     * On the new login shell, Socket only resolves after authentication.
+     * Wait for it in the background so SPA transitions that do not reload the
+     * document still install Socket/Cmd bridges and emit ready exactly once.
+     * This task is canceled by re-injection and destroy().
+     *
+     * @param {AbortController} abort
+     * @param {number} epoch
+     */
+    _awaitSocketBootstrap(abort, epoch) {
+        this._socketBootstrapTask = (async () => {
+            try {
+                await this.pupPage.waitForFunction(
+                    () => Boolean(window.require?.('WAWebSocketModel')?.Socket),
+                    {
+                        timeout: 5 * 60 * 1000,
+                        signal: abort.signal,
+                        polling: 2000,
+                    },
+                );
+            } catch {
+                return; // aborted, navigated, or timed out without blocking init
+            }
+            if (abort.signal.aborted || epoch !== this._injectEpoch) return;
+            try {
+                const bridges =
+                    await this.pupPage.evaluate(installWWebJSBridges);
+                if (abort.signal.aborted || epoch !== this._injectEpoch) return;
+                this._setAuthDiagnostics('socket_bridges_installed', {
+                    socketReady: Boolean(bridges?.socketReady),
+                    cmdReady: Boolean(bridges?.cmdReady),
+                    socketState: bridges?.state ?? null,
+                });
+            } catch (err) {
+                if (!abort.signal.aborted) {
+                    this._setAuthDiagnostics('socket_bridge_error', {
+                        error: String(
+                            err && err.message ? err.message : err,
+                        ).slice(0, 160),
+                    });
+                }
+            }
+        })().catch(() => {});
     }
 
     /**
@@ -542,26 +1054,46 @@ class Client extends EventEmitter {
         this._framenavigatedRegistered = true;
 
         this.pupPage.on('framenavigated', async (frame) => {
-            if (frame.parentFrame() !== null) return;
+            try {
+                if (frame.parentFrame() !== null) return;
+                if (this.pupBrowser && this.pupBrowser.isConnected() === false)
+                    return;
 
-            const isLogout =
-                frame.url().includes('post_logout=1') || this.lastLoggedOut;
+                const isLogout =
+                    frame.url().includes('post_logout=1') || this.lastLoggedOut;
 
-            if (isLogout) {
-                this.emit(Events.DISCONNECTED, 'LOGOUT');
-                await this.authStrategy.logout();
-                await this.authStrategy.beforeBrowserInitialized();
-                await this.authStrategy.afterBrowserInitialized();
-                this.lastLoggedOut = false;
+                if (isLogout) {
+                    this.emit(Events.DISCONNECTED, 'LOGOUT');
+                    await this.authStrategy.logout();
+                    await this.authStrategy.beforeBrowserInitialized();
+                    await this.authStrategy.afterBrowserInitialized();
+                    this.lastLoggedOut = false;
+                }
+
+                let storeAvailable = false;
+                try {
+                    storeAvailable = await this.pupPage.evaluate(() => {
+                        return typeof window.WWebJS !== 'undefined';
+                    });
+                } catch (ignoredError) {
+                    // Navigation replaced the execution context; the next
+                    // framenavigated event or injection owns the page.
+                    return;
+                }
+
+                if (!isLogout && storeAvailable) return;
+
+                await this.inject();
+            } catch (err) {
+                if (this.pupBrowser && this.pupBrowser.isConnected() === false)
+                    return;
+                this._setAuthDiagnostics('navigation_inject_error', {
+                    error: String(err && err.message ? err.message : err).slice(
+                        0,
+                        160,
+                    ),
+                });
             }
-
-            const storeAvailable = await this.pupPage.evaluate(() => {
-                return typeof window.WWebJS !== 'undefined';
-            });
-
-            if (!isLogout && storeAvailable) return;
-
-            await this.inject();
         });
     }
 
@@ -602,9 +1134,15 @@ class Client extends EventEmitter {
                     clearInterval(window.codeInterval); // remove existing interval
                 }
                 window.codeInterval = setInterval(async () => {
+                    // Socket does not resolve on the new login shell until
+                    // authentication completes; keep the pairing flow alive.
                     const state =
-                        window.require('WAWebSocketModel').Socket.state;
-                    if (state != 'UNPAIRED' && state != 'UNPAIRED_IDLE') {
+                        window.require?.('WAWebSocketModel')?.Socket?.state;
+                    if (
+                        state &&
+                        state != 'UNPAIRED' &&
+                        state != 'UNPAIRED_IDLE'
+                    ) {
                         clearInterval(window.codeInterval);
                         return;
                     }
@@ -1332,14 +1870,41 @@ class Client extends EventEmitter {
      * Closes the client
      */
     async destroy() {
-        if (this._injectAbort) this._injectAbort.abort();
+        if (this._injectAbort) {
+            this._injectAbort.abort();
+            this._injectAbort = null;
+        }
+        // Invalidate in-flight auth callbacks from the destroyed run.
+        this._injectEpoch += 1;
         this._framenavigatedRegistered = false;
+
+        if (this._qrLoadingScreenListener) {
+            this.removeListener(
+                Events.LOADING_SCREEN,
+                this._qrLoadingScreenListener,
+            );
+            this._qrLoadingScreenListener = null;
+        }
+
+        if (this._socketBootstrapTask) {
+            await Promise.race([
+                this._socketBootstrapTask.catch(() => {}),
+                new Promise((resolve) => setTimeout(resolve, 1000)),
+            ]);
+            this._socketBootstrapTask = null;
+        }
 
         const browser = this.pupBrowser;
         const isConnected = browser?.isConnected?.();
         if (isConnected) {
-            await browser.close();
+            try {
+                await browser.close();
+            } catch (err) {
+                // A concurrent navigation/close may already have detached it.
+                if (browser.isConnected?.()) throw err;
+            }
         }
+        this._setAuthDiagnostics('destroyed');
         await this.authStrategy.destroy();
     }
 

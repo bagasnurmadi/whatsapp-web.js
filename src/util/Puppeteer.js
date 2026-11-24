@@ -20,4 +20,30 @@ async function exposeFunctionIfAbsent(page, name, fn) {
     await page.exposeFunction(name, fn);
 }
 
-module.exports = { exposeFunctionIfAbsent };
+/**
+ * Expose a page function, replacing an earlier binding if one exists.
+ * Used by injection callbacks so re-injection after an SPA navigation does
+ * not keep stale Closures bound to a superseded inject() run.
+ *
+ * @param {object} page - Puppeteer Page instance
+ * @param {string} name
+ * @param {Function} fn
+ */
+async function upsertFunction(page, name, fn) {
+    const exist = await page.evaluate((name) => {
+        return typeof window[name] === 'function';
+    }, name);
+    if (exist && typeof page.removeExposedFunction === 'function') {
+        try {
+            await page.removeExposedFunction(name);
+        } catch {
+            // Context was replaced mid-update; the old binding is gone.
+            return;
+        }
+    } else if (exist) {
+        return;
+    }
+    await page.exposeFunction(name, fn);
+}
+
+module.exports = { exposeFunctionIfAbsent, upsertFunction };
